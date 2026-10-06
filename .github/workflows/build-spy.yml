@@ -1,0 +1,47 @@
+name: Build EnchantSpy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+
+      - name: Build libEnchantSpy.so
+        run: |
+          CXX=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++
+          $CXX -std=c++17 -O2 -fPIC -shared -fvisibility=hidden -static-libstdc++ \
+            -Wl,--gc-sections -s -o libEnchantSpy.so spy.cpp -llog
+
+      - name: Package .levipack
+        run: |
+          mkdir -p pkg/enchantspy
+          cp libEnchantSpy.so pkg/enchantspy/
+          cat > pkg/enchantspy/manifest.json <<'JSON'
+          {
+            "type": "preload-native",
+            "entry": "libEnchantSpy.so",
+            "name": "EnchantSpy",
+            "author": "EnchantSpy",
+            "version": "1.0.0",
+            "minecraft_versions": []
+          }
+          JSON
+          (cd pkg && zip -r ../EnchantSpy.levipack enchantspy)
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: EnchantSpy
+          path: |
+            EnchantSpy.levipack
+            libEnchantSpy.so
+
