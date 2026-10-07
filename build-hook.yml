@@ -1,0 +1,49 @@
+name: Build EnchantHookProbe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28c
+
+      - name: Configure and build (SDK version)
+        run: |
+          cmake -S hook_probe -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target hook_probe
+          find build -name 'libhook_probe.so'
+
+      - name: Package .levipack
+        run: |
+          SO=$(find build -name 'libhook_probe.so' | head -n 1)
+          mkdir -p pkg/enchanthookprobe
+          cp "$SO" pkg/enchanthookprobe/libhook_probe.so
+          cat > pkg/enchanthookprobe/manifest.json <<'JSON'
+          {
+            "type": "preload-native",
+            "entry": "libhook_probe.so",
+            "name": "EnchantHookProbe",
+            "author": "EnchantHookProbe",
+            "version": "1.0.0",
+            "minecraft_versions": []
+          }
+          JSON
+          (cd pkg && zip -r ../EnchantHookProbe.levipack enchanthookprobe)
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: EnchantHookProbe
+          path: |
+            EnchantHookProbe.levipack
+            build/**/libhook_probe.so
