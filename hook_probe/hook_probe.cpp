@@ -1,7 +1,8 @@
-// EnchantHookProbe v3（観察専用・SDK版）: アイテムの追加データ(タグ)の読み取りテスト
-// ホバーテキストを作る関数(+0xff9cae8)と、死亡時の判定関数(+0xff9ca78)に観察フックを入れ、
-// 引数のアイテム(ItemStack)の追加データ([ItemStack+0x10])を、ゲーム自身の読み取り関数
-// (+0x11203310 = 名前があるか / +0x112036a4 = 名前の値(1バイト)) で調べてログに書きます。
+// EnchantHookProbe v3.1（観察専用・SDK版）: アイテムの追加データ(タグ)の読み取りテスト
+// ・ホバーテキスト(+0xff9cae8)だけは、引数のアイテム(ItemStack)の追加データ([ItemStack+0x10])を、
+//   ゲーム自身の読み取り関数(+0x11203310 = 名前があるか / +0x112036a4 = 名前の値(1バイト))で調べる。
+// ・死亡時の2関数(+0xff9ca78, +0xff917dc)は、引数の指す先を読まず、値だけをログに書く。
+//   （v3 では死亡時の関数の引数をアイテムと決めつけて読み、/kill でクラッシュした。その修正版）
 // ゲームのデータは一切書き換えません。元の関数へは引数をそのまま渡します（末尾呼び出し）。
 //
 // ログ: /storage/emulated/0/Android/media/<ランチャー>/EnchantHookProbe/log.txt
@@ -97,7 +98,7 @@ constexpr KeyDef kKeys[] = {
     {"minecraft:dynamic_properties", 28}, {"display", 7}, {"ench", 4}, {"Damage", 6},
 };
 
-// ItemStack の追加データ([ItemStack+0x10])を調べてログに書く
+// ItemStack の追加データ([ItemStack+0x10])を調べてログに書く（ホバー専用。検証済みの呼び出しだけに使う）
 void ProbeStack(const char *who, int n, void *stack) {
   if (!gContains || !gGetByte) return;
   if (!PlausiblePtr(stack)) { Log("%s #%d stack=%p (not a plausible pointer)", who, n, stack); return; }
@@ -117,7 +118,7 @@ void ProbeStack(const char *who, int n, void *stack) {
 
 using GenericFn = uint64_t (*)(void *, void *, void *, void *);
 
-// ホバーテキスト(+0xff9cae8): 第2引数が ItemStack（前回の解析からの推測）
+// ホバーテキスト(+0xff9cae8): 第2引数が ItemStack（v3 の実機ログで確認済み）
 GenericFn gOrig_Hover = nullptr;
 std::atomic<int> gCalls_Hover{0};
 uint64_t Hook_Hover(void *a, void *b, void *c, void *d) {
@@ -126,13 +127,22 @@ uint64_t Hook_Hover(void *a, void *b, void *c, void *d) {
   TAILCALL return gOrig_Hover(a, b, c, d);
 }
 
-// 死亡時の判定(+0xff9ca78): 第3引数が ItemStack（前回のログからの推測）
+// 死亡時の判定(+0xff9ca78): 引数の指す先は読まず、値だけ記録する
 GenericFn gOrig_Death = nullptr;
 std::atomic<int> gCalls_Death{0};
 uint64_t Hook_Death(void *a, void *b, void *c, void *d) {
   int n = ++gCalls_Death;
-  if (ShouldLog(n)) ProbeStack("DEATH", n, c);
+  if (ShouldLog(n)) Log("DEATH #%d a=%p b=%p c=%p d=%p", n, a, b, c, d);
   TAILCALL return gOrig_Death(a, b, c, d);
+}
+
+// 「keep_on_death を持つか」を調べている関数(+0xff917dc): こちらも値だけ記録する
+GenericFn gOrig_KodCheck = nullptr;
+std::atomic<int> gCalls_KodCheck{0};
+uint64_t Hook_KodCheck(void *a, void *b, void *c, void *d) {
+  int n = ++gCalls_KodCheck;
+  if (ShouldLog(n)) Log("KODCHECK #%d a=%p b=%p c=%p d=%p", n, a, b, c, d);
+  TAILCALL return gOrig_KodCheck(a, b, c, d);
 }
 
 struct Target {
@@ -145,6 +155,7 @@ struct Target {
 Target kTargets[] = {
     {"HOVER_9cae8", 0xff9cae8, &gOrig_Hover, &Hook_Hover},
     {"DEATH_9ca78", 0xff9ca78, &gOrig_Death, &Hook_Death},
+    {"KODCHECK_917dc", 0xff917dc, &gOrig_KodCheck, &Hook_KodCheck},
 };
 
 } // namespace
@@ -173,7 +184,7 @@ public:
     mkdir(dir, 0777);
     snprintf(gLogPath, sizeof(gLogPath), "%s/log.txt", dir);
     if (FILE *lf = fopen(gLogPath, "w")) fclose(lf);
-    Log("EnchantHookProbe v3 start (observe only).");
+    Log("EnchantHookProbe v3.1 start (observe only).");
 
     const uintptr_t base = FindBase();
     if (!base) { Log("libminecraftpe.so base not found."); return true; }
