@@ -1,4 +1,4 @@
-// EnchantHookProbe v3.1（観察専用・SDK版）: アイテムの追加データ(タグ)の読み取りテスト
+// EnchantHookProbe v3.2（観察専用・SDK版）: アイテムの追加データ(タグ)の読み取りテスト
 // ・ホバーテキスト(+0xff9cae8)だけは、引数のアイテム(ItemStack)の追加データ([ItemStack+0x10])を、
 //   ゲーム自身の読み取り関数(+0x11203310 = 名前があるか / +0x112036a4 = 名前の値(1バイト))で調べる。
 // ・死亡時の2関数(+0xff9ca78, +0xff917dc)は、引数の指す先を読まず、値だけをログに書く。
@@ -95,7 +95,8 @@ bool PlausiblePtr(void *p) {
 struct KeyDef { const char *name; size_t len; };
 constexpr KeyDef kKeys[] = {
     {"minecraft:keep_on_death", 23}, {"minecraft:item_lock", 19},
-    {"minecraft:dynamic_properties", 28}, {"display", 7}, {"ench", 4}, {"Damage", 6},
+    {"minecraft:dynamic_properties", 28}, {"dynamic_properties", 18},
+    {"display", 7}, {"ench", 4}, {"Damage", 6},
 };
 
 // ItemStack の追加データ([ItemStack+0x10])を調べてログに書く（ホバー専用。検証済みの呼び出しだけに使う）
@@ -104,7 +105,7 @@ void ProbeStack(const char *who, int n, void *stack) {
   if (!PlausiblePtr(stack)) { Log("%s #%d stack=%p (not a plausible pointer)", who, n, stack); return; }
   void *tag = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(stack) + 0x10);
   if (!PlausiblePtr(tag)) { Log("%s #%d stack=%p tag=%p (no user data)", who, n, stack, tag); return; }
-  char buf[256];
+  char buf[384];
   int off = snprintf(buf, sizeof(buf), "%s #%d stack=%p tag=%p |", who, n, stack, tag);
   for (const KeyDef &k : kKeys) {
     bool has = gContains(tag, k.name, k.len);
@@ -184,7 +185,7 @@ public:
     mkdir(dir, 0777);
     snprintf(gLogPath, sizeof(gLogPath), "%s/log.txt", dir);
     if (FILE *lf = fopen(gLogPath, "w")) fclose(lf);
-    Log("EnchantHookProbe v3.1 start (observe only).");
+    Log("EnchantHookProbe v3.2 start (observe only).");
 
     const uintptr_t base = FindBase();
     if (!base) { Log("libminecraftpe.so base not found."); return true; }
