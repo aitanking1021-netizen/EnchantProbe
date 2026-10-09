@@ -555,268 +555,164 @@ std::atomic<int> gEdits_Mining{0};
 float ApplyMiningEdit(const char *who, float orig, void *stack) {
   if (!(orig == orig)) return orig;                 // NaN はそのまま
   if (kOnlyWhenEffective && orig <= 1.0f) return orig;
-  if (!PlausiblePtr(stack)) return orbuf(kChunk);
-  for (const Range &r : data) {
-    for (uint64_t pos = r.start & ~7ULL; pos < r.end; pos += kChunk) {
-      size_t n = static_cast<size_t>(std::min<uint64_t>(kChunk, r.end - pos));
-      n &= ~static_cast<size_t>(7);
-      if (n == 0 || !SafeRead(pos, buf.data(), n)) continue;
-      for (size_t i = 0; i < n; i += 8) {
-        uint64_t v;
-        memcpy(&v, buf.data() + i, 8);
-        f(pos + i, v);
-      }
-    }
-  }
-}
-
-void ScanVtables(const std::vector<Range> &data, uint64_t libLo, uint64_t libHi, uint64_t base,
-                 const char *const *classes, int nClasses) {
-  constexpr size_t kBuf = 16384, kOverlap = 64, kStep = kBuf - kOverlap;
-  std::vector<std::string> pats;
-  for (int c = 0; c < nClasses; c++) {
-    std::string p(1, '\0');
-    p += classes[c];
-    p.push_back('\0');
-    pats.push_back(p);
-  }
-  // 1) クラス名の文字列（前後が NUL）の場所
-  std::unordered_map<uint64_t, int> nameAddr;
-  {
-    std::vector<unsigned char> buf(kBuf);
-    for (const Range &r : data) {
-      for (uint64_t pos = r.start; pos < r.end; pos += kStep) {
-        size_t n = static_cast<size_t>(std::min<uint64_t>(kBuf, r.end - pos));
-        if (!SafeRead(pos, buf.data(), n)) continue;
-        const bool last = (pos + kStep >= r.end);
-        for (int c = 0; c < nClasses; c++) {
-          auto it = buf.begin();
-          while (true) {
-            it = std::search(it, buf.begin() + n, pats[c].begin(), pats[c].end());
-            if (it == buf.begin() + n) break;
-            size_t idx = static_cast<size_t>(it - buf.begin());
-            if (idx < kStep || last) nameAddr[pos + idx + 1] = c;
-            ++it;
-          }
-        }
-      }
-    }
-  }
-  Log("VTSCAN names found: %zu", nameAddr.size());
-
-  // 2) その文字列を指す typeinfo（[vptr][name]...）
-  std::unordered_map<uint64_t, int> typeinfos;
-  ForEachSlot(data, [&](uint64_t slot, uint64_t v) {
-    auto it = nameAddr.find(v);
-    if (it != nameAddr.end()) typeinfos[slot - 8] = it->second;
-  });
-  {
-    // typeinfo の先頭(vptr)がライブラリ内を指していなければ除く
-    for (auto it = typeinfos.begin(); it != typeinfos.end();) {
-      uint64_t vptr = 0;
-      if (!SafeRead(it->first, &vptr, 8) || vptr < libLo || vptr >= libHi) it = typeinfos.erase(it);
-      else ++it;
-    }
-  }
-  Log("VTSCAN typeinfos found: %zu", typeinfos.size());
-
-  // 3) その typeinfo を指す vtable（直前が offset_to_top = 小さな整数）
-  struct VT { int cls; uint64_t slot; int64_t ott; };
-  std::vector<VT> vts;
-  ForEachSlot(data, [&](uint64_t slot, uint64_t v) {
-    auto it = typeinfos.find(v);
-    if (it == typeinfos.end()) return;
-    int64_t ott = 0;
-    if (!SafeRead(slot - 8, &ott, 8)) return;
-    if (ott > 0x100000 || ott < -0x100000) return; // 小さな整数でなければ vtable ではない
-    vts.push_back({it->second, slot, ott});
-  });
-  Log("VTSCAN vtables found: %zu", vts.size());
-
-  for (const VT &v : vts) {
-    const uint64_t vtAddr = v.slot + 8; // オブジェクトが持つ vtable ポインタが指す先
-    Log("VTABLE %s vt=+0x%llx offset_to_top=%lld", classes[v.cls], (unsigned long long)(vtAddr - base),
-        (long long)v.ott);
-    uint64_t ent[64];
-    if (!SafeRead(vtAddr, ent, sizeof(ent))) { Log("VTABLE %s entries unreadable", classes[v.cls]); continue; }
-    for (int row = 0; row < 8; row++) {
-      char line[512];
-      int off = snprintf(line, sizeof(line), "VTENT %s [%02d]", classes[v.cls], row * 8);
-      for (int k = 0; k < 8; k++) {
-        const uint64_t e = ent[row * 8 + k];
-        if (e >= libLo && e < libHi) off += snprintf(line + off, sizeof(line) - off, " +0x%llx", (unsigned long long)(e - base));
-        else off += snprintf(line + off, sizeof(line) - off, " raw:0x%llx", (unsigned long long)e);
-      }
-      Log("%s", line);
-    }
-  }
-  Log("VTSCAN done");
-}
-
-const char *const kVtClasses[] = {
-    "23DurabilityItemComponent", "19DiggerItemComponent", "19DamageItemComponent",
-    "19WeaponItemComponent", "21WearableItemComponent", "18ArmorItemComponent",
-    "13ItemComponent", "10DiggerItem", "10WeaponItem", "4Item",
-};
-
-
-// ---- 採掘速度の個体別変更（v4.0） ----
-constexpr bool kEnableMiningEdit = true;        // false にすると、採掘速度のフックは入れない
-constexpr bool kOnlyWhenEffective = true;       // true: 元の値が 1.0 より大きいとき（道具が得意なブロック）だけ変える
-constexpr uint64_t kDoubleVtOffset = 0x131a2be0; // 数値タグ(DoubleTag)の vtable の位置（base から）。版が変わると要取り直し
-uint64_t gDoubleVt = 0;                          // 実行時に base + kDoubleVtOffset を入れる
-
-// CompoundTag の次のノード（in-order 後続）を求める。DumpCompound と同じ仮定（libc++ の std::map）
-bool NextNode(uint64_t node, uint64_t &next) {
-  uint64_t right = 0;
-  if (!SafeRead(node + 8, &right, 8)) return false;
-  if (Mask(right) != 0) {
-    next = Mask(right);
-    for (int j = 0; j < 64; j++) {
-      uint64_t l = 0;
-      if (!SafeRead(next, &l, 8)) return false;
-      if (Mask(l) == 0) return true;
-      next = Mask(l);
-    }
-    return false;
-  }
-  uint64_t x = node;
-  for (int j = 0; j < 64; j++) {
-    uint64_t p = 0, pl = 0;
-    if (!SafeRead(x + 0x10, &p, 8)) return false;
-    p = Mask(p);
-    if (!SafeRead(p, &pl, 8)) return false;
-    if (Mask(pl) == x) { next = p; return true; }
-    x = p;
-  }
-  return false;
-}
-
-// compound の子ノードを順に f(ノードのアドレス, キー名) へ渡す。f が true を返したら止めて true を返す
-template <class F>
-bool ForEachChild(uint64_t compound, F f) {
-  unsigned char head[0x20];
-  if (!SafeRead(compound, head, sizeof(head))) return false;
-  uint64_t begin = 0, size = 0;
-  memcpy(&begin, head + 0x08, 8);
-  memcpy(&size, head + 0x18, 8);
-  if (size == 0 || size > 64) return false;
-  const uint64_t endNode = compound + 0x10;
-  uint64_t node = Mask(begin);
-  for (int i = 0; i < 64 && node != endNode; i++) {
-    std::string key = ReadStdString(node + 0x20);
-    if (f(node, key)) return true;
-    uint64_t next = 0;
-    if (!NextNode(node, next)) return false;
-    node = next;
-  }
-  return false;
-}
-
-struct WantedNum {
-  const char *name;
-  double val;
-  bool found;
-};
-
-// ItemStack のタグ(tagp)の DynamicProperties → アドオンごとの枠 → 名前 の順にたどり、数値(double)を読む。
-// 型の目印(vtable)が DoubleTag と一致するものだけを数値として読む。見つかったものは found=true
-void ReadDynamicNumbers(void *tagp, WantedNum *w, int count) {
-  const uint64_t t = Mask(reinterpret_cast<uint64_t>(tagp));
-  uint64_t compoundVt = 0;
-  if (!SafeRead(t, &compoundVt, 8) || gDoubleVt == 0) return;
-  ForEachChild(t, [&](uint64_t node, const std::string &key) -> bool {
-    if (key != "DynamicProperties") return false;
-    uint64_t vt = 0;
-    if (!SafeRead(node + 0x38, &vt, 8) || vt != compoundVt) return true;
-    ForEachChild(node + 0x38, [&](uint64_t packNode, const std::string &) -> bool {
-      uint64_t pvt = 0;
-      if (!SafeRead(packNode + 0x38, &pvt, 8) || pvt != compoundVt) return false;
-      ForEachChild(packNode + 0x38, [&](uint64_t n2, const std::string &k2) -> bool {
-        for (int i = 0; i < count; i++) {
-          if (k2 != w[i].name) continue;
-          uint64_t vt2 = 0;
-          double d = 0;
-          if (SafeRead(n2 + 0x38, &vt2, 8) && vt2 == gDoubleVt && SafeRead(n2 + 0x40, &d, 8)) {
-            w[i].val = d;
-            w[i].found = true;
-          }
-        }
-        return false; // 枠の中は最後まで見る
-      });
-      return false;   // すべての枠を見る
-    });
-    return true;      // DynamicProperties は1つだけ
-  });
-}
-
-double ClampD(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
-
-struct KeyDef { const char *name; size_t len; };
-constexpr KeyDef kKeys[] = {
-    {"minecraft:keep_on_death", 23}, {"minecraft:item_lock", 19},
-    {"minecraft:dynamic_properties", 28}, {"DynamicProperties", 17},
-    {"display", 7}, {"ench", 4}, {"Damage", 6},
-};
-
-// ItemStack の追加データ([ItemStack+0x10])を調べてログに書く（ホバー専用。検証済みの呼び出しだけに使う）
-void ProbeStack(const char *who, int n, void *stack) {
-  if (!gContains || !gGetByte) return;
-  if (!PlausiblePtr(stack)) { Log("%s #%d stack=%p (not a plausible pointer)", who, n, stack); return; }
+  if (!PlausiblePtr(stack)) return orig;
   void *tag = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(stack) + 0x10);
-  if (!PlausiblePtr(tag)) { Log("%s #%d stack=%p tag=%p (no user data)", who, n, stack, tag); return; }
-  char buf[384];
-  int off = snprintf(buf, sizeof(buf), "%s #%d stack=%p tag=%p |", who, n, stack, tag);
-  for (const KeyDef &k : kKeys) {
-    bool has = gContains(tag, k.name, k.len);
-    off += snprintf(buf + off, sizeof(buf) - off, " %s=%d", k.name, has ? 1 : 0);
+  if (!PlausiblePtr(tag)) return orig;
+  WantedNum w[2] = {{"miningSpeedAdd", 0.0, false}, {"miningSpeedMul", 1.0, false}};
+  ReadDynamicNumbers(tag, w, 2);
+  if (!w[0].found && !w[1].found) return orig;
+  const double add = w[0].found ? ClampD(w[0].val, -100.0, 1000.0) : 0.0;
+  const double mul = w[1].found ? ClampD(w[1].val, 0.0, 100.0) : 1.0;
+  const double out = ClampD((static_cast<double>(orig) + add) * mul, 0.0, 10000.0);
+  const int n = ++gEdits_Mining;
+  if (ShouldLog(n)) Log("%s edit #%d: orig=%g add=%g mul=%g -> %g", who, n, (double)orig, add, mul, out);
+  return static_cast<float>(out);
+}
+
+float Hook_SpeedDigger(void *self, void *stack, void *block) {
+  float r = gOrig_SpeedDigger(self, stack, block);
+  int n = ++gCalls_SpeedDigger;
+  if (n <= 5) Log("SPEED_DIGGER call #%d: orig=%g stack=%p", n, (double)r, stack);
+  return ApplyMiningEdit("SPEED_DIGGER", r, stack);
+}
+
+float Hook_SpeedWeapon(void *self, void *stack, void *block) {
+  float r = gOrig_SpeedWeapon(self, stack, block);
+  int n = ++gCalls_SpeedWeapon;
+  if (n <= 5) Log("SPEED_WEAPON call #%d: orig=%g stack=%p", n, (double)r, stack);
+  return ApplyMiningEdit("SPEED_WEAPON", r, stack);
+}
+
+struct SpeedTarget {
+  const char *name;
+  uintptr_t offset;
+  uint32_t expectWord; // 先頭の命令（この値と完全に一致しなければ入れない）
+  void **orig;
+  void *detour;
+};
+
+struct Target {
+  const char *name;
+  uintptr_t offset;
+  GenericFn *orig;
+  GenericFn detour;
+};
+
+Target kTargets[] = {
+    {"HOVER_9cae8", 0xff9cae8, &gOrig_Hover, &Hook_Hover},
+    {"DEATH_9ca78", 0xff9ca78, &gOrig_Death, &Hook_Death},
+    {"KODCHECK_917dc", 0xff917dc, &gOrig_KodCheck, &Hook_KodCheck},
+};
+
+} // namespace
+
+class HookProbeMod {
+public:
+  static HookProbeMod &instance() {
+    static HookProbeMod inst;
+    return inst;
   }
-  int kod = gGetByte(tag, "minecraft:keep_on_death", 23);
-  int lock = gGetByte(tag, "minecraft:item_lock", 19);
-  snprintf(buf + off, sizeof(buf) - off, " | byte(kod)=%d byte(lock)=%d", kod, lock);
-  Log("%s", buf);
-  DumpTagKeys(who, n, tag);
-}
 
-using GenericFn = uint64_t (*)(void *, void *, void *, void *);
+  HookProbeMod() : mSelf(*ll::mod::NativeMod::current()) {}
 
-// ホバーテキスト(+0xff9cae8): 第2引数が ItemStack（v3 の実機ログで確認済み）
-GenericFn gOrig_Hover = nullptr;
-std::atomic<int> gCalls_Hover{0};
-uint64_t Hook_Hover(void *a, void *b, void *c, void *d) {
-  int n = ++gCalls_Hover;
-  if (ShouldLog(n)) ProbeStack("HOVER", n, b);
-  TAILCALL return gOrig_Hover(a, b, c, d);
-}
+  bool load() { return true; }
 
-// 死亡時の判定(+0xff9ca78): 引数の指す先は読まず、値だけ記録する
-GenericFn gOrig_Death = nullptr;
-std::atomic<int> gCalls_Death{0};
-uint64_t Hook_Death(void *a, void *b, void *c, void *d) {
-  int n = ++gCalls_Death;
-  if (ShouldLog(n)) Log("DEATH #%d a=%p b=%p c=%p d=%p", n, a, b, c, d);
-  TAILCALL return gOrig_Death(a, b, c, d);
-}
+  bool enable() {
+    gStart = NowSec();
+    char pkg[256] = {0};
+    if (FILE *cmd = fopen("/proc/self/cmdline", "rb")) {
+      fread(pkg, 1, sizeof(pkg) - 1, cmd);
+      fclose(cmd);
+    }
+    if (!pkg[0]) strncpy(pkg, "org.levimc.launcher", sizeof(pkg) - 1);
+    char dir[600];
+    snprintf(dir, sizeof(dir), "/storage/emulated/0/Android/media/%s/EnchantHookProbe", pkg);
+    mkdir(dir, 0777);
+    snprintf(gLogPath, sizeof(gLogPath), "%s/log.txt", dir);
+    if (FILE *lf = fopen(gLogPath, "w")) fclose(lf);
+    Log("EnchantHookProbe v4.0 start (mining speed edit %s).", kEnableMiningEdit ? "ON" : "OFF");
 
-// 「keep_on_death を持つか」を調べている関数(+0xff917dc): こちらも値だけ記録する
-GenericFn gOrig_KodCheck = nullptr;
-std::atomic<int> gCalls_KodCheck{0};
-uint64_t Hook_KodCheck(void *a, void *b, void *c, void *d) {
-  int n = ++gCalls_KodCheck;
-  if (ShouldLog(n)) Log("KODCHECK #%d a=%p b=%p c=%p d=%p", n, a, b, c, d);
-  TAILCALL return gOrig_KodCheck(a, b, c, d);
-}
+    Log("safe read %s", InitSafeRead() ? "ready" : "NOT ready");
 
+    const uintptr_t base = FindBase();
+    if (!base) { Log("libminecraftpe.so base not found."); return true; }
+    Log("base=0x%llx", (unsigned long long)base);
 
-// ---- 採掘速度（関数表の89番）: 引数は (this, ItemStack, Block)、戻り値は float ----
-using SpeedFn = float (*)(void *self, void *stack, void *block);
-SpeedFn gOrig_SpeedDigger = nullptr;
-SpeedFn gOrig_SpeedWeapon = nullptr;
-std::atomic<int> gCalls_SpeedDigger{0};
-std::atomic<int> gCalls_SpeedWeapon{0};
-std::atomic<int> gEdits_Mining{0};
+    // タグ読み取り関数の先頭命令を確認してから使う（版が違えば使わない）
+    const uint32_t wContains = ReadWord(base + 0x11203310);
+    const uint32_t wGetByte = ReadWord(base + 0x112036a4);
+    if (wContains == 0xd10143ff && wGetByte == 0xd10103ff) {
+      gContains = reinterpret_cast<ContainsFn>(base + 0x11203310);
+      gGetByte = reinterpret_cast<GetByteFn>(base + 0x112036a4);
+      Log("tag readers ready (contains/getByte)");
+    } else {
+      Log("tag readers NOT ready: words 0x%08x 0x%08x (版が違う可能性)", wContains, wGetByte);
+    }
 
-float ApplyMiningEdit(const char *who, float orig, void *stack) {
-  if (!(orig == orig)) return orig;                 // NaN はそのまま
-  if (kOnlyWhenEffective && orig <= 1.0f) return orig;
-  if (!PlausiblePtr(stack)) return or
+    mHooks.resize(sizeof(kTargets) / sizeof(kTargets[0]));
+    for (size_t i = 0; i < mHooks.size(); i++) {
+      Target &t = kTargets[i];
+      const uintptr_t addr = base + t.offset;
+      const uint32_t w = ReadWord(addr);
+      const bool ok = (w & 0xFFC07FFF) == 0xA9807BFD || (w & 0xFF0003FF) == 0xD10003FF;
+      if (!ok) { Log("%s: first word 0x%08x not a prologue. skipped.", t.name, w); continue; }
+      mHooks[i] = pl::memory::HookHandle(reinterpret_cast<void *>(addr),
+                                         reinterpret_cast<void *>(t.detour),
+                                         reinterpret_cast<void **>(t.orig),
+                                         pl::memory::HookPriority::Normal);
+      Log("%s: hook installed=%d (+0x%llx)", t.name, mHooks[i].installed() ? 1 : 0,
+          (unsigned long long)t.offset);
+    }
+
+    gDoubleVt = base + kDoubleVtOffset;
+
+    // 採掘速度のフック: 先頭の命令が想定どおりのときだけ入れる（版が違えば何もしない）
+    if (kEnableMiningEdit) {
+      const SpeedTarget speedTargets[] = {
+          {"SPEED_DIGGER_e71f0", 0xffe71f0, 0xfc1d0fe8, reinterpret_cast<void **>(&gOrig_SpeedDigger),
+           reinterpret_cast<void *>(&Hook_SpeedDigger)},
+          {"SPEED_WEAPON_67148", 0xfd67148, 0xd10283ff, reinterpret_cast<void **>(&gOrig_SpeedWeapon),
+           reinterpret_cast<void *>(&Hook_SpeedWeapon)},
+      };
+      mSpeedHooks.resize(sizeof(speedTargets) / sizeof(speedTargets[0]));
+      for (size_t i = 0; i < mSpeedHooks.size(); i++) {
+        const SpeedTarget &t = speedTargets[i];
+        const uintptr_t addr = base + t.offset;
+        const uint32_t w = ReadWord(addr);
+        if (w != t.expectWord) {
+          Log("%s: first word 0x%08x (expected 0x%08x). skipped.", t.name, w, t.expectWord);
+          continue;
+        }
+        mSpeedHooks[i] = pl::memory::HookHandle(reinterpret_cast<void *>(addr), t.detour, t.orig,
+                                                pl::memory::HookPriority::Normal);
+        Log("%s: hook installed=%d (+0x%llx)", t.name, mSpeedHooks[i].installed() ? 1 : 0,
+            (unsigned long long)t.offset);
+      }
+    }
+    std::thread([base]() {
+      std::vector<Range> data;
+      uint64_t lo = 0, hi = 0;
+      if (!ReadLibMaps(data, lo, hi)) { Log("VTSCAN: maps not found"); return; }
+      Log("VTSCAN start: %zu data ranges", data.size());
+      ScanVtables(data, lo, hi, base, kVtClasses, static_cast<int>(sizeof(kVtClasses) / sizeof(kVtClasses[0])));
+    }).detach();
+    return true;
+  }
+
+  bool disable() {
+    for (auto &h : mHooks) h.reset();
+    for (auto &h : mSpeedHooks) h.reset();
+    return true;
+  }
+
+  bool unload() { return true; }
+
+  [[nodiscard]] ll::mod::NativeMod &getSelf() const { return mSelf; }
+
+private:
+  ll::mod::NativeMod &mSelf;
+  std::vector<pl::memory::HookHandle> mHooks;
+  std::vector<pl::memory::HookHandle> mSpeedHooks;
+};
+
+PL_REGISTER_MOD(HookProbeMod, HookProbeMod::instance())
