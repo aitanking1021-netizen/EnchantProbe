@@ -1,5 +1,6 @@
-// EnchantHookProbe v3.3（観察専用・SDK版）: アイテムの追加データ(タグ)の読み取りテスト
+// EnchantHookProbe v3.4（観察専用・SDK版）: アイテムの追加データ(タグ)の読み取りテスト
 // ・v3.3: ホバー時に、タグの中にあるキー名を全部ログへ書き出す（動的プロパティの保存先を探すため）。
+// ・v3.4: v3.3 のログで保存先は "DynamicProperties"（大文字小文字あり）と分かったので、入れ子の中身も深さ3までたどる。
 //   メモリは write() 経由の安全な読み取りだけで調べる（無効なアドレスでも落ちずに失敗として返る）。
 // ・ホバーテキスト(+0xff9cae8)だけは、引数のアイテム(ItemStack)の追加データ([ItemStack+0x10])を、
 //   ゲーム自身の読み取り関数(+0x11203310 = 名前があるか / +0x112036a4 = 名前の値(1バイト))で調べる。
@@ -135,7 +136,9 @@ std::string Hex(const unsigned char *p, size_t n) {
 }
 
 // libc++ の std::string(24バイト)を読む。短い文字列は先頭バイトの最下位ビットが0、長い文字列は1
-std::string ReadStdString(uint64_t addr) {
+// printable に true が入るのは、全部が表示できる文字(0x20〜0x7e)だったとき
+std::string ReadStdString(uint64_t addr, bool *printable = nullptr) {
+  if (printable) *printable = false;
   unsigned char raw[24];
   if (!SafeRead(addr, raw, sizeof(raw))) return "<unreadable>";
   std::string s;
@@ -152,46 +155,66 @@ std::string ReadStdString(uint64_t addr) {
     if (!SafeRead(ptr, tmp, static_cast<size_t>(len))) return "<unreadable data>";
     s.assign(tmp, static_cast<size_t>(len));
   }
-  for (char &c : s) if (c < 0x20 || c > 0x7e) c = '?';
+  bool ok = !s.empty();
+  for (char &c : s) {
+    if (c < 0x20 || c > 0x7e) { ok = false; c = '?'; }
+  }
+  if (printable) *printable = ok;
   return s;
 }
 
-// CompoundTag の中のキー名を全部書き出す。
+// CompoundTag の中のキー名を書き出す。値が CompoundTag なら、その中も同じ方法でたどる（深さ3まで）
 // 仮定（libc++ の std::map）: [tag+0x08]=先頭ノード, [tag+0x10]=根, [tag+0x18]=要素数。
-//   ノード: +0=左, +8=右, +0x10=親, +0x20=キー(std::string 24バイト), +0x38〜=値
-// 仮定が外れていても、先頭の生バイト(TAGHEAD)と各ノードの生バイトが残るので、次の調査に使える
-void DumpTagKeys(const char *who, int n, void *tagp) {
-  const uint64_t t = Mask(reinterpret_cast<uint64_t>(tagp));
-  unsigned char head[0x30];
-  if (!SafeRead(t, head, sizeof(head))) { Log("%s #%d TAGHEAD unreadable", who, n); return; }
-  Log("%s #%d TAGHEAD %s", who, n, Hex(head, sizeof(head)).c_str());
-  uint64_t begin = 0, root = 0, size = 0;
+//   ノード: +0=左, +8=右, +0x10=親, +0x20=キー(std::string 24バイト), +0x38〜=値（CompoundTag はここに直接入る）
+// 値の先頭の8バイトは型ごとの vtable。トップのタグ(CompoundTag)の vtable と同じなら入れ子の CompoundTag とみなす
+// 仮定が外れていても、各ノードの生バイトがログに残るので、次の調査に使える
+void DumpCompound(const char *who, int n, uint64_t compound, uint64_t compoundVt, int depth,
+                  const std::string &path, int &budget) {
+  unsigned char head[0x20];
+  if (!SafeRead(compound, head, sizeof(head))) { Log("%s #%d %s unreadable", who, n, path.c_str()); return; }
+  uint64_t begin = 0, size = 0;
   memcpy(&begin, head + 0x08, 8);
-  memcpy(&root, head + 0x10, 8);
   memcpy(&size, head + 0x18, 8);
-  const uint64_t endNode = t + 0x10;
+  const uint64_t endNode = compound + 0x10;
   if (size == 0 || size > 64) {
-    Log("%s #%d TAGKEYS size=%llu (the layout guess may be wrong)", who, n, (unsigned long long)size);
+    Log("%s #%d %s size=%llu (the layout guess may be wrong)", who, n, path.c_str(), (unsigned long long)size);
     return;
   }
   uint64_t node = Mask(begin);
   int count = 0;
   for (; count < 64 && node != endNode; count++) {
+    if (budget-- <= 0) { Log("%s #%d %s budget exhausted", who, n, path.c_str()); return; }
     unsigned char nd[0x50];
-    if (!SafeRead(node, nd, sizeof(nd))) { Log("%s #%d TAGKEYS node %d unreadable", who, n, count); return; }
-    uint64_t left = 0, right = 0, parent = 0;
-    memcpy(&left, nd, 8);
+    if (!SafeRead(node, nd, sizeof(nd))) { Log("%s #%d %s node %d unreadable", who, n, path.c_str(), count); return; }
+    uint64_t right = 0, vt = 0;
     memcpy(&right, nd + 8, 8);
-    memcpy(&parent, nd + 0x10, 8);
+    memcpy(&vt, nd + 0x38, 8);
     std::string key = ReadStdString(node + 0x20);
-    Log("%s #%d KEY[%d] \"%s\" value+0x38: %s", who, n, count, key.c_str(), Hex(nd + 0x38, 0x18).c_str());
+    std::string here = path + "/" + key;
+    const bool isCompound = (vt == compoundVt);
+    if (isCompound) {
+      Log("%s #%d KEY %s (compound)", who, n, here.c_str());
+      if (depth < 3) DumpCompound(who, n, node + 0x38, compoundVt, depth + 1, here, budget);
+    } else {
+      // 値の中身を、いくつかの型だと仮定した読み方で並べる（どれが正しいかはログを見て判断する）
+      int32_t i32 = 0; double f64 = 0; float f32 = 0;
+      memcpy(&i32, nd + 0x40, 4);
+      memcpy(&f64, nd + 0x40, 8);
+      memcpy(&f32, nd + 0x40, 4);
+      bool printable = false;
+      std::string str = ReadStdString(node + 0x40, &printable);
+      char extra[200];
+      int off = snprintf(extra, sizeof(extra), "i32=%d f32=%g f64=%g", i32, (double)f32, f64);
+      if (printable) snprintf(extra + off, sizeof(extra) - off, " str=\"%s\"", str.c_str());
+      Log("%s #%d KEY %s raw: %s | %s", who, n, here.c_str(), Hex(nd + 0x38, 0x18).c_str(), extra);
+    }
 
     uint64_t next = 0;
     if (Mask(right) != 0) {
       next = Mask(right);
       for (int j = 0; j < 64; j++) {
         uint64_t l = 0;
-        if (!SafeRead(next, &l, 8)) { Log("%s #%d TAGKEYS walk failed", who, n); return; }
+        if (!SafeRead(next, &l, 8)) { Log("%s #%d %s walk failed", who, n, path.c_str()); return; }
         if (Mask(l) == 0) break;
         next = Mask(l);
       }
@@ -199,23 +222,31 @@ void DumpTagKeys(const char *who, int n, void *tagp) {
       uint64_t x = node;
       for (int j = 0; j < 64; j++) {
         uint64_t p = 0, pl = 0;
-        if (!SafeRead(x + 0x10, &p, 8)) { Log("%s #%d TAGKEYS walk failed", who, n); return; }
+        if (!SafeRead(x + 0x10, &p, 8)) { Log("%s #%d %s walk failed", who, n, path.c_str()); return; }
         p = Mask(p);
-        if (!SafeRead(p, &pl, 8)) { Log("%s #%d TAGKEYS walk failed", who, n); return; }
+        if (!SafeRead(p, &pl, 8)) { Log("%s #%d %s walk failed", who, n, path.c_str()); return; }
         if (Mask(pl) == x) { next = p; break; }
         x = p;
       }
     }
-    if (next == 0) { Log("%s #%d TAGKEYS no successor", who, n); return; }
+    if (next == 0) { Log("%s #%d %s no successor", who, n, path.c_str()); return; }
     node = next;
   }
-  Log("%s #%d TAGKEYS done: walked=%d size=%llu", who, n, count, (unsigned long long)size);
+  Log("%s #%d %s done: walked=%d size=%llu", who, n, path.c_str(), count, (unsigned long long)size);
+}
+
+void DumpTagKeys(const char *who, int n, void *tagp) {
+  const uint64_t t = Mask(reinterpret_cast<uint64_t>(tagp));
+  uint64_t vt = 0;
+  if (!SafeRead(t, &vt, 8)) { Log("%s #%d TAGHEAD unreadable", who, n); return; }
+  int budget = 48;
+  DumpCompound(who, n, t, vt, 0, "", budget);
 }
 
 struct KeyDef { const char *name; size_t len; };
 constexpr KeyDef kKeys[] = {
     {"minecraft:keep_on_death", 23}, {"minecraft:item_lock", 19},
-    {"minecraft:dynamic_properties", 28}, {"dynamic_properties", 18},
+    {"minecraft:dynamic_properties", 28}, {"DynamicProperties", 17},
     {"display", 7}, {"ench", 4}, {"Damage", 6},
 };
 
@@ -305,6 +336,59 @@ public:
     snprintf(dir, sizeof(dir), "/storage/emulated/0/Android/media/%s/EnchantHookProbe", pkg);
     mkdir(dir, 0777);
     snprintf(gLogPath, sizeof(gLogPath), "%s/log.txt", dir);
+    if (FILE *lf = fopen(gLogPath, "w")) fclose(lf);
+    Log("EnchantHookProbe v3.4 start (observe only).");
+
+    Log("safe read %s", InitSafeRead() ? "ready" : "NOT ready");
+
+    const uintptr_t base = FindBase();
+    if (!base) { Log("libminecraftpe.so base not found."); return true; }
+    Log("base=0x%llx", (unsigned long long)base);
+
+    // タグ読み取り関数の先頭命令を確認してから使う（版が違えば使わない）
+    const uint32_t wContains = ReadWord(base + 0x11203310);
+    const uint32_t wGetByte = ReadWord(base + 0x112036a4);
+    if (wContains == 0xd10143ff && wGetByte == 0xd10103ff) {
+      gContains = reinterpret_cast<ContainsFn>(base + 0x11203310);
+      gGetByte = reinterpret_cast<GetByteFn>(base + 0x112036a4);
+      Log("tag readers ready (contains/getByte)");
+    } else {
+      Log("tag readers NOT ready: words 0x%08x 0x%08x (版が違う可能性)", wContains, wGetByte);
+    }
+
+    mHooks.resize(sizeof(kTargets) / sizeof(kTargets[0]));
+    for (size_t i = 0; i < mHooks.size(); i++) {
+      Target &t = kTargets[i];
+      const uintptr_t addr = base + t.offset;
+      const uint32_t w = ReadWord(addr);
+      const bool ok = (w & 0xFFC07FFF) == 0xA9807BFD || (w & 0xFF0003FF) == 0xD10003FF;
+      if (!ok) { Log("%s: first word 0x%08x not a prologue. skipped.", t.name, w); continue; }
+      mHooks[i] = pl::memory::HookHandle(reinterpret_cast<void *>(addr),
+                                         reinterpret_cast<void *>(t.detour),
+                                         reinterpret_cast<void **>(t.orig),
+                                         pl::memory::HookPriority::Normal);
+      Log("%s: hook installed=%d (+0x%llx)", t.name, mHooks[i].installed() ? 1 : 0,
+          (unsigned long long)t.offset);
+    }
+    return true;
+  }
+
+  bool disable() {
+    for (auto &h : mHooks) h.reset();
+    return true;
+  }
+
+  bool unload() { return true; }
+
+  [[nodiscard]] ll::mod::NativeMod &getSelf() const { return mSelf; }
+
+private:
+  ll::mod::NativeMod &mSelf;
+  std::vector<pl::memory::HookHandle> mHooks;
+};
+
+PL_REGISTER_MOD(HookProbeMod, HookProbeMod::instance())
+ sizeof(gLogPath), "%s/log.txt", dir);
     if (FILE *lf = fopen(gLogPath, "w")) fclose(lf);
     Log("EnchantHookProbe v3.3 start (observe only).");
 
