@@ -1,4 +1,6 @@
-// EnchantHookProbe v3.2（観察専用・SDK版）: アイテムの追加データ(タグ)の読み取りテスト
+// EnchantHookProbe v3.3（観察専用・SDK版）: アイテムの追加データ(タグ)の読み取りテスト
+// ・v3.3: ホバー時に、タグの中にあるキー名を全部ログへ書き出す（動的プロパティの保存先を探すため）。
+//   メモリは write() 経由の安全な読み取りだけで調べる（無効なアドレスでも落ちずに失敗として返る）。
 // ・ホバーテキスト(+0xff9cae8)だけは、引数のアイテム(ItemStack)の追加データ([ItemStack+0x10])を、
 //   ゲーム自身の読み取り関数(+0x11203310 = 名前があるか / +0x112036a4 = 名前の値(1バイト))で調べる。
 // ・死亡時の2関数(+0xff9ca78, +0xff917dc)は、引数の指す先を読まず、値だけをログに書く。
@@ -8,6 +10,9 @@
 // ログ: /storage/emulated/0/Android/media/<ランチャー>/EnchantHookProbe/log.txt
 
 #include <atomic>
+#include <cerrno>
+#include <fcntl.h>
+#include <mutex>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +20,7 @@
 #include <ctime>
 #include <string>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 #include <pl/Mod.hpp>
@@ -92,6 +98,120 @@ bool PlausiblePtr(void *p) {
   return v > 0x10000 && v < 0x0000800000000000ULL && (v & 0x7) == 0;
 }
 
+
+// ---- 安全なメモリ読み取り ----
+// パイプへの write() は、無効なアドレスだと落ちずに EFAULT で失敗する。これを使って、読んでよいか確かめながら読む
+int gPipe[2] = {-1, -1};
+std::mutex gPipeMutex;
+
+bool InitSafeRead() {
+  return pipe2(gPipe, O_NONBLOCK | O_CLOEXEC) == 0;
+}
+
+bool SafeRead(uint64_t addr, void *out, size_t n) {
+  if (gPipe[0] < 0 || n == 0 || n > 4096) return false;
+  addr &= 0x00FFFFFFFFFFFFFFULL; // 最上位バイトのタグは外す
+  if (addr < 0x10000 || addr >= 0x0000800000000000ULL) return false;
+  std::lock_guard<std::mutex> lock(gPipeMutex);
+  ssize_t w = write(gPipe[1], reinterpret_cast<const void *>(static_cast<uintptr_t>(addr)), n);
+  if (w != static_cast<ssize_t>(n)) {
+    if (w > 0) { char tmp[4096]; ssize_t r = read(gPipe[0], tmp, static_cast<size_t>(w)); (void)r; }
+    return false;
+  }
+  return read(gPipe[0], out, n) == static_cast<ssize_t>(n);
+}
+
+uint64_t Mask(uint64_t v) { return v & 0x00FFFFFFFFFFFFFFULL; }
+
+std::string Hex(const unsigned char *p, size_t n) {
+  std::string s;
+  char t[4];
+  for (size_t i = 0; i < n; i++) {
+    snprintf(t, sizeof(t), "%02x", p[i]);
+    s += t;
+    if (i % 8 == 7 && i + 1 < n) s += ' ';
+  }
+  return s;
+}
+
+// libc++ の std::string(24バイト)を読む。短い文字列は先頭バイトの最下位ビットが0、長い文字列は1
+std::string ReadStdString(uint64_t addr) {
+  unsigned char raw[24];
+  if (!SafeRead(addr, raw, sizeof(raw))) return "<unreadable>";
+  std::string s;
+  if ((raw[0] & 1) == 0) {
+    size_t len = raw[0] >> 1;
+    if (len > 22) return "<bad short len>";
+    s.assign(reinterpret_cast<char *>(raw + 1), len);
+  } else {
+    uint64_t len = 0, ptr = 0;
+    memcpy(&len, raw + 8, 8);
+    memcpy(&ptr, raw + 16, 8);
+    if (len == 0 || len > 80) return "<bad long len>";
+    char tmp[96];
+    if (!SafeRead(ptr, tmp, static_cast<size_t>(len))) return "<unreadable data>";
+    s.assign(tmp, static_cast<size_t>(len));
+  }
+  for (char &c : s) if (c < 0x20 || c > 0x7e) c = '?';
+  return s;
+}
+
+// CompoundTag の中のキー名を全部書き出す。
+// 仮定（libc++ の std::map）: [tag+0x08]=先頭ノード, [tag+0x10]=根, [tag+0x18]=要素数。
+//   ノード: +0=左, +8=右, +0x10=親, +0x20=キー(std::string 24バイト), +0x38〜=値
+// 仮定が外れていても、先頭の生バイト(TAGHEAD)と各ノードの生バイトが残るので、次の調査に使える
+void DumpTagKeys(const char *who, int n, void *tagp) {
+  const uint64_t t = Mask(reinterpret_cast<uint64_t>(tagp));
+  unsigned char head[0x30];
+  if (!SafeRead(t, head, sizeof(head))) { Log("%s #%d TAGHEAD unreadable", who, n); return; }
+  Log("%s #%d TAGHEAD %s", who, n, Hex(head, sizeof(head)).c_str());
+  uint64_t begin = 0, root = 0, size = 0;
+  memcpy(&begin, head + 0x08, 8);
+  memcpy(&root, head + 0x10, 8);
+  memcpy(&size, head + 0x18, 8);
+  const uint64_t endNode = t + 0x10;
+  if (size == 0 || size > 64) {
+    Log("%s #%d TAGKEYS size=%llu (the layout guess may be wrong)", who, n, (unsigned long long)size);
+    return;
+  }
+  uint64_t node = Mask(begin);
+  int count = 0;
+  for (; count < 64 && node != endNode; count++) {
+    unsigned char nd[0x50];
+    if (!SafeRead(node, nd, sizeof(nd))) { Log("%s #%d TAGKEYS node %d unreadable", who, n, count); return; }
+    uint64_t left = 0, right = 0, parent = 0;
+    memcpy(&left, nd, 8);
+    memcpy(&right, nd + 8, 8);
+    memcpy(&parent, nd + 0x10, 8);
+    std::string key = ReadStdString(node + 0x20);
+    Log("%s #%d KEY[%d] \"%s\" value+0x38: %s", who, n, count, key.c_str(), Hex(nd + 0x38, 0x18).c_str());
+
+    uint64_t next = 0;
+    if (Mask(right) != 0) {
+      next = Mask(right);
+      for (int j = 0; j < 64; j++) {
+        uint64_t l = 0;
+        if (!SafeRead(next, &l, 8)) { Log("%s #%d TAGKEYS walk failed", who, n); return; }
+        if (Mask(l) == 0) break;
+        next = Mask(l);
+      }
+    } else {
+      uint64_t x = node;
+      for (int j = 0; j < 64; j++) {
+        uint64_t p = 0, pl = 0;
+        if (!SafeRead(x + 0x10, &p, 8)) { Log("%s #%d TAGKEYS walk failed", who, n); return; }
+        p = Mask(p);
+        if (!SafeRead(p, &pl, 8)) { Log("%s #%d TAGKEYS walk failed", who, n); return; }
+        if (Mask(pl) == x) { next = p; break; }
+        x = p;
+      }
+    }
+    if (next == 0) { Log("%s #%d TAGKEYS no successor", who, n); return; }
+    node = next;
+  }
+  Log("%s #%d TAGKEYS done: walked=%d size=%llu", who, n, count, (unsigned long long)size);
+}
+
 struct KeyDef { const char *name; size_t len; };
 constexpr KeyDef kKeys[] = {
     {"minecraft:keep_on_death", 23}, {"minecraft:item_lock", 19},
@@ -115,6 +235,7 @@ void ProbeStack(const char *who, int n, void *stack) {
   int lock = gGetByte(tag, "minecraft:item_lock", 19);
   snprintf(buf + off, sizeof(buf) - off, " | byte(kod)=%d byte(lock)=%d", kod, lock);
   Log("%s", buf);
+  DumpTagKeys(who, n, tag);
 }
 
 using GenericFn = uint64_t (*)(void *, void *, void *, void *);
@@ -185,7 +306,9 @@ public:
     mkdir(dir, 0777);
     snprintf(gLogPath, sizeof(gLogPath), "%s/log.txt", dir);
     if (FILE *lf = fopen(gLogPath, "w")) fclose(lf);
-    Log("EnchantHookProbe v3.2 start (observe only).");
+    Log("EnchantHookProbe v3.3 start (observe only).");
+
+    Log("safe read %s", InitSafeRead() ? "ready" : "NOT ready");
 
     const uintptr_t base = FindBase();
     if (!base) { Log("libminecraftpe.so base not found."); return true; }
